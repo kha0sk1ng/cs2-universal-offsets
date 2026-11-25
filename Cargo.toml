@@ -33,3 +33,11 @@ opt-level = 3
 lto = true
 strip = true
 codegen-units = 1
+
+# Day-to-day profile: `cargo build --profile fast` (output in target/fast/).
+# Parallel codegen, no LTO, incremental. Use `release` only for published builds.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
