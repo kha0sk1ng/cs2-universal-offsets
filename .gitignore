@@ -1,9 +1,37 @@
-# build artifacts
+# Rust build output
 /target
-/build.log
+*.pdb
 
-# in-progress logs (we keep the dumps/ folder itself — the latest
+# Leftovers of other build systems (xmake/CMake/VS); they once got committed by mistake
+/build/
+.xmake/
+.deps/
+.gens/
+.objs/
+.vs/
+CMakeFiles/
+CMakeCache.txt
+
+# Logs
+/build.log
+*.log
+# the published dump keeps its own log
+!/include/cs2-sdk.log
+# in-progress logs (we keep the dumps/ folder itself - the latest
 # session is published with every release)
 dumps/**/logs/
-.xmake/
-build/
+
+# Local runs: output of a dump started from the repo root
+/cs2-sdk.log
+/status.json
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Secrets
+.env
+.env.*
