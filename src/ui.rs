@@ -6,6 +6,7 @@
 //! Windows Terminal both render it correctly.
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // ANSI palette
@@ -34,15 +35,22 @@ pub const WARN: &str = "!";
 
 pub const HLINE: &str = "─";
 
-static mut NO_SOUND: bool = false;
+static NO_SOUND: AtomicBool = AtomicBool::new(false);
+/// Quiet mode: no banner, sections, progress or sound. Only errors go to stderr.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+fn quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
 
 /// Enable Windows 10+ virtual-terminal processing so ANSI codes render.
-pub fn init(no_sound: bool) {
-    unsafe {
-        NO_SOUND = no_sound;
-    }
+pub fn init(no_sound: bool, quiet: bool) {
+    NO_SOUND.store(no_sound || quiet, Ordering::Relaxed);
+    QUIET.store(quiet, Ordering::Relaxed);
     #[cfg(windows)]
-    enable_vt();
+    if !quiet {
+        enable_vt();
+    }
 }
 
 #[cfg(windows)]
@@ -95,7 +103,7 @@ pub enum Cue {
 }
 
 pub fn sound(cue: Cue) {
-    if unsafe { NO_SOUND } {
+    if NO_SOUND.load(Ordering::Relaxed) {
         return;
     }
     match cue {
@@ -128,6 +136,9 @@ fn flush() {
 const WIDTH: usize = 72;
 
 pub fn banner() {
+    if quiet() {
+        return;
+    }
     let v = env!("CARGO_PKG_VERSION");
     println!();
     println!("    {FG_GOLD}{BOLD} ▄█▀▀▀█▄{RESET}");
@@ -137,6 +148,9 @@ pub fn banner() {
 }
 
 pub fn section(title: &str) {
+    if quiet() {
+        return;
+    }
     let used = title.chars().count() + 5;
     println!();
     println!(
@@ -146,26 +160,46 @@ pub fn section(title: &str) {
 }
 
 pub fn kv(key: &str, value: &str) {
+    if quiet() {
+        return;
+    }
     println!(
         "    {FG_GRAY}{BULLET}{RESET} {FG_SOFT}{key:<18}{RESET} {FG_WHITE}{value}{RESET}"
     );
 }
 
 pub fn ok(msg: &str) {
+    if quiet() {
+        return;
+    }
     println!("    {FG_GREEN}{CHECK}{RESET} {FG_WHITE}{msg}{RESET}");
 }
 
 pub fn warn(msg: &str) {
+    if quiet() {
+        eprintln!("warn: {msg}");
+        return;
+    }
     println!("    {FG_YELLOW}{WARN}{RESET} {FG_WHITE}{msg}{RESET}");
 }
 
 pub fn err(msg: &str) {
+    if quiet() {
+        eprintln!("error: {msg}");
+        return;
+    }
     println!("    {FG_RED}{CROSS}{RESET} {FG_WHITE}{msg}{RESET}");
 }
 
 
 /// Closing line of a run: one sentence, coloured by outcome.
 pub fn done(ok: bool, msg: &str) {
+    if quiet() {
+        if !ok {
+            eprintln!("error: {msg}");
+        }
+        return;
+    }
     println!();
     if ok {
         println!("  {FG_GREEN}{BOLD}{CHECK} {msg}{RESET}");
@@ -177,6 +211,9 @@ pub fn done(ok: bool, msg: &str) {
 
 /// Redrawable progress line (carriage return, no newline).
 pub fn progress(done: usize, total: usize, label: &str) {
+    if quiet() {
+        return;
+    }
     const BAR: usize = 34;
     let pct = if total == 0 {
         1.0
@@ -197,6 +234,9 @@ pub fn progress(done: usize, total: usize, label: &str) {
 }
 
 pub fn progress_clear() {
+    if quiet() {
+        return;
+    }
     print!("\r{}\r", " ".repeat(110));
     flush();
 }
@@ -213,6 +253,9 @@ fn trim_label(s: &str, max: usize) -> String {
 }
 
 pub fn found(name: &str, addr: u64, detail: &str) {
+    if quiet() {
+        return;
+    }
     progress_clear();
     println!(
         "    {FG_GREEN}{CHECK}{RESET} {FG_SOFT}{name:<44}{RESET} {FG_RULE}{ARROW}{RESET} \
@@ -221,6 +264,9 @@ pub fn found(name: &str, addr: u64, detail: &str) {
 }
 
 pub fn not_found(name: &str, reason: &str) {
+    if quiet() {
+        return;
+    }
     progress_clear();
     println!(
         "    {FG_RED}{CROSS}{RESET} {FG_WHITE}{name:<44}{RESET} {DIM}{FG_GRAY}{reason}{RESET}"
@@ -228,5 +274,8 @@ pub fn not_found(name: &str, reason: &str) {
 }
 
 pub fn divider() {
+    if quiet() {
+        return;
+    }
     println!("  {FG_RULE}{}{RESET}", HLINE.repeat(WIDTH));
 }

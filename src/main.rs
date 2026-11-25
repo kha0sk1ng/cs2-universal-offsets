@@ -28,7 +28,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use chrono::Local;
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand};
 use log::LevelFilter;
 use memflow::prelude::v1::*;
 use serde_json::json;
@@ -37,6 +37,8 @@ use simplelog::*;
 
 mod analysis;
 mod checks;
+mod diff;
+mod events_gen;
 mod memory;
 mod output;
 mod patterns;
@@ -44,8 +46,16 @@ mod source2;
 mod ui;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "CS2 Universal Dumper — offsets + patterns in one run")]
+#[command(
+    author,
+    version,
+    about = "CS2 Universal Dumper — offsets + patterns in one run",
+    args_conflicts_with_subcommands = true
+)]
 struct Args {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+
     #[arg(short, long)]
     connector: Option<String>,
 
@@ -80,14 +90,68 @@ struct Args {
     /// as the function itself did not change (see status.json auto_healed).
     #[arg(long, default_value = "include")]
     previous: PathBuf,
+
+    /// No banner, colors, progress or sound; only errors go to stderr.
+    #[arg(long)]
+    quiet: bool,
+
+    /// Print one JSON summary object on stdout (implies --quiet). Also used
+    /// for failures: `{"ok":false,"error":"..."}`.
+    #[arg(long)]
+    json: bool,
+
+    /// Probe only patterns whose name contains one of these (comma separated,
+    /// case-insensitive). Read-only: writes no files and skips the offsets pass.
+    #[arg(long, value_delimiter = ',', value_name = "NAME")]
+    only: Vec<String>,
+
+    /// Shell command to run after a successful dump. `{out}` is replaced with
+    /// the absolute output directory and `{build}` with the build number.
+    /// Wrap placeholders in quotes if the path may contain spaces. A failing
+    /// hook makes the exit code 2.
+    #[arg(long, value_name = "COMMAND")]
+    post_dump: Option<String>,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Compare two dump directories (patterns, game events, vtables, offsets).
+    Diff(diff::DiffArgs),
+    /// Generate a typed C++ header for every game event from gameevents.json.
+    Events(events_gen::EventsArgs),
+}
 
-    ui::init(args.no_sound);
+fn main() {
+    let args = Args::parse();
+    let json_mode = args.json || matches!(&args.cmd, Some(Cmd::Diff(d)) if d.json);
+    let code = match run(args) {
+        Ok(code) => code,
+        Err(e) => {
+            if json_mode {
+                println!("{}", json!({ "ok": false, "error": format!("{e:#}") }));
+            } else {
+                eprintln!("Error: {e:?}");
+            }
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+fn run(args: Args) -> Result<i32> {
+    match &args.cmd {
+        Some(Cmd::Diff(a)) => return diff::run(a),
+        Some(Cmd::Events(a)) => return events_gen::run(a),
+        None => {}
+    }
+
+    ui::init(args.no_sound, args.quiet || args.json);
     ui::banner();
     ui::sound(ui::Cue::Start);
+
+    if !args.only.is_empty() {
+        return run_only(&args);
+    }
 
     let now = Local::now();
     let out_dir = args.output.clone();
@@ -101,7 +165,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to create {}", d.display()))?;
     }
 
-    init_logging(&out_dir, args.verbose)?;
+    init_logging(Some(&out_dir), args.verbose, args.quiet || args.json)?;
 
     ui::section("Session");
     ui::kv("Timestamp", &now.format("%Y-%m-%d %H:%M:%S").to_string());
@@ -530,12 +594,133 @@ fn main() -> Result<()> {
     if all_ok {
         ui::sound(ui::Cue::Success);
         ui::done(true, &format!("Dump complete for {build} — written to {}", out_dir.display()));
-        Ok(())
     } else {
         ui::sound(ui::Cue::Failure);
         ui::done(false, &format!("Dump for {build} failed a check — see status.json and cs2-sdk.log in {}", out_dir.display()));
-        std::process::exit(1);
     }
+
+    // --- post-dump hook (successful dumps only) -----------------------------
+    let mut hook_json = serde_json::Value::Null;
+    let mut hook_failed = false;
+    if all_ok && let Some(cmd) = args.post_dump.as_deref() {
+        ui::section("Post-dump hook");
+        match run_post_dump(cmd, &out_dir, build_number, args.quiet || args.json) {
+            Ok(code) => {
+                hook_failed = code != 0;
+                hook_json = json!({ "ok": code == 0, "exit": code });
+                if hook_failed {
+                    ui::err(&format!("hook exited with code {code}"));
+                } else {
+                    ui::ok("hook finished");
+                }
+            }
+            Err(e) => {
+                hook_failed = true;
+                hook_json = json!({ "ok": false, "error": format!("{e:#}") });
+                ui::err(&format!("hook failed to start: {e:#}"));
+            }
+        }
+    }
+
+    if args.json {
+        let names = |f: &dyn Fn(&patterns::PatternHit) -> bool| -> Vec<&str> {
+            sig_report
+                .as_ref()
+                .map(|r| r.hits.iter().filter(|h| f(h)).map(|h| h.name.as_str()).collect())
+                .unwrap_or_default()
+        };
+        let summary = json!({
+            "ok": all_ok && !hook_failed,
+            "build": build_number,
+            "output": std::path::absolute(&out_dir).unwrap_or_else(|_| out_dir.clone()),
+            "offsets_ok": offsets_ok,
+            "patterns_ok": sigs_ok,
+            "checks_ok": checks_ok,
+            "patterns": {
+                "found": sig_report.as_ref().map(|r| r.found),
+                "total": sig_report.as_ref().map(|r| r.total),
+                "missing": names(&|h| !h.found),
+                "healed": names(&|h| h.healed_from.is_some()),
+            },
+            "post_dump": hook_json,
+        });
+        println!("{summary}");
+    }
+
+    Ok(if !all_ok {
+        1
+    } else if hook_failed {
+        2
+    } else {
+        0
+    })
+}
+
+/// `--only`: scan a handful of patterns against the live process and print
+/// the result. Writes nothing and skips the offsets pass.
+fn run_only(args: &Args) -> Result<i32> {
+    let needles: Vec<String> = args.only.iter().map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()).collect();
+    let sigs: Vec<patterns::Pattern> = patterns::database::CS2_PATTERNS
+        .iter()
+        .filter(|p| {
+            let name = p.name.to_ascii_lowercase();
+            needles.iter().any(|n| name.contains(n))
+        })
+        .cloned()
+        .collect();
+    anyhow::ensure!(!sigs.is_empty(), "no pattern name contains any of {:?}", args.only);
+
+    init_logging(None, args.verbose, args.quiet || args.json)?;
+    ui::section("Attach");
+    let mut os = build_os(args)?;
+    let mut process = os
+        .process_by_name(&args.process_name)
+        .with_context(|| format!("process '{}' not found", args.process_name))?;
+    ui::ok(&format!("attached to {} (pid {})", args.process_name, process.info().pid));
+
+    ui::section(&format!("Probe ({} of {} patterns)", sigs.len(), patterns::database::CS2_PATTERNS.len()));
+    let previous = patterns::load_previous(&args.previous.join("patterns").join("patterns.json"));
+    let report = patterns::scan_all(&mut process, &sigs, previous.as_ref())?;
+    let all_found = report.found == report.total;
+
+    if args.json {
+        println!("{}", json!({ "ok": all_found, "found": report.found, "total": report.total, "patterns": report.hits }));
+    } else if !args.quiet {
+        for h in report.hits.iter().filter(|h| h.found) {
+            if let (Some(rva), Some(synth)) = (h.rva, h.pattern_synth.as_deref()) {
+                println!("    {} {}+0x{:X}\n      {}", h.name, h.module, rva, synth);
+            }
+        }
+        ui::done(all_found, &format!("{}/{} probed patterns resolved", report.found, report.total));
+    }
+    Ok(i32::from(!all_found))
+}
+
+/// Run the `--post-dump` command through the platform shell and return its
+/// exit code. Output goes to stderr in quiet/json mode so stdout stays clean.
+fn run_post_dump(cmd: &str, out_dir: &Path, build: Option<u32>, to_stderr: bool) -> Result<i32> {
+    use std::process::Command;
+
+    let abs = std::path::absolute(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
+    let line = cmd
+        .replace("{out}", &abs.display().to_string())
+        .replace("{build}", &build.map(|b| b.to_string()).unwrap_or_else(|| "unknown".into()));
+
+    #[cfg(windows)]
+    let output = {
+        use std::os::windows::process::CommandExt;
+        Command::new("cmd").arg("/C").raw_arg(&line).output()?
+    };
+    #[cfg(not(windows))]
+    let output = Command::new("sh").arg("-c").arg(&line).output()?;
+
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    if to_stderr {
+        eprint!("{text}");
+    } else {
+        print!("{text}");
+    }
+    Ok(output.status.code().unwrap_or(-1))
 }
 
 fn build_os(args: &Args) -> Result<OsInstanceArcBox<'static>> {
@@ -570,8 +755,9 @@ fn build_os(args: &Args) -> Result<OsInstanceArcBox<'static>> {
     }
 }
 
-fn init_logging(out_dir: &Path, verbose: u8) -> Result<()> {
+fn init_logging(out_dir: Option<&Path>, verbose: u8, quiet: bool) -> Result<()> {
     let term_level = match verbose {
+        _ if quiet => LevelFilter::Error,
         0 => LevelFilter::Warn,
         1 => LevelFilter::Info,
         2 => LevelFilter::Debug,
@@ -586,11 +772,13 @@ fn init_logging(out_dir: &Path, verbose: u8) -> Result<()> {
     ));
     // File log captures warnings+ only — keeps cs2-sdk.log small and
     // useful for post-mortem instead of being a multi-megabyte trace dump.
-    loggers.push(WriteLogger::new(
-        LevelFilter::Warn,
-        Config::default(),
-        File::create(out_dir.join("cs2-sdk.log"))?,
-    ));
+    if let Some(out_dir) = out_dir {
+        loggers.push(WriteLogger::new(
+            LevelFilter::Warn,
+            Config::default(),
+            File::create(out_dir.join("cs2-sdk.log"))?,
+        ));
+    }
     CombinedLogger::init(loggers).ok();
     Ok(())
 }
@@ -713,4 +901,40 @@ fn format_found_patterns(report: &patterns::PatternReport) -> String {
     s.push_str("  ]\n");
     s.push_str("}\n");
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_dump_substitutes_placeholders_and_returns_exit_code() {
+        let dir = std::env::temp_dir();
+        // `exit N` works in both `cmd /C` and `sh -c`.
+        assert_eq!(run_post_dump("exit 0", &dir, Some(14184), true).unwrap(), 0);
+        assert_eq!(run_post_dump("exit 3", &dir, None, true).unwrap(), 3);
+    }
+
+    #[test]
+    fn post_dump_expands_build_placeholder() {
+        let dir = std::env::temp_dir();
+        // Succeeds only when `{build}` was replaced by the real number.
+        #[cfg(windows)]
+        let cmd = "if \"{build}\"==\"14184\" (exit 0) else (exit 9)";
+        #[cfg(not(windows))]
+        let cmd = "[ \"{build}\" = 14184 ]";
+        assert_eq!(run_post_dump(cmd, &dir, Some(14184), true).unwrap(), 0);
+        assert_ne!(run_post_dump(cmd, &dir, Some(1), true).unwrap(), 0);
+    }
+
+    #[test]
+    fn post_dump_expands_out_placeholder() {
+        let dir = std::env::temp_dir();
+        // `dir "<out>"` / `test -d` fail unless {out} is a real absolute directory.
+        #[cfg(windows)]
+        let cmd = "cd /d \"{out}\"";
+        #[cfg(not(windows))]
+        let cmd = "test -d \"{out}\"";
+        assert_eq!(run_post_dump(cmd, &dir, None, true).unwrap(), 0);
+    }
 }

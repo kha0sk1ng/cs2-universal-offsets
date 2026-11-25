@@ -68,8 +68,31 @@ The SDK is written to `.\include\`. A full trace log is always written to `inclu
 | `--skip-patterns` | off | Skip the signature pass |
 | `--no-sound` | off | No audio cue |
 | `-v`, `-vv`, `-vvv` | warn | Terminal log level (the file log is always trace) |
+| `--quiet` | off | No banner or progress; warnings and errors go to stderr. Implies no sound |
+| `--json` | off | Print one JSON summary line on stdout (`ok`, `build`, `output`, `offsets_ok`, `patterns_ok`, `checks_ok`, `patterns{found,total,missing,healed}`, `post_dump`). Failures print `{"ok":false,"error":..}` |
+| `--only <NAME,..>` | — | Read-only scan of the patterns whose name contains any of the given substrings (case-insensitive). Writes nothing; exits 1 if any is missing |
+| `--post-dump <CMD>` | — | Run a shell command after a successful dump. `{out}` expands to the absolute output dir and `{build}` to the build number |
 
 `include/manifest.json` tells you whether the run was complete: `offsets_ok`, `signatures_ok`, and `signature_counts.found` / `.total`.
+
+Exit codes: `0` ok, `1` a self-check failed or an error occurred, `2` the `--post-dump` command failed.
+
+### Subcommands
+
+These need no running game:
+
+```powershell
+# Compare two dumps: patterns (added / removed / changed prologue / moved rva), events,
+# vtables, offsets and the build numbers. --fail-on-change exits 1 when anything differs.
+.\cs2-sdk.exe diff <old-dump> <new-dump> [--json] [--fail-on-change]
+
+# Generate a typed C++ header from gameevents.json (a file or a dump directory).
+.\cs2-sdk.exe events <gameevents.json|dump-dir> [-o gameevents.hpp] [--namespace cs2::events]
+```
+
+`tools/live.py` is a small client for the `cs2-live` reader (`health`, `bases`, `read`, `scan`, `batch`); see its docstring.
+
+Do not use the dumped offsets in a project that has to survive game updates; keep signatures and schema names and resolve at runtime.
 
 ### What the dumper does not do
 
